@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>USB Print</title>
+<style>
+:root{--bg:#f6f6f4;--fg:#1b1b1b;--card:#fff;--ac:#2563eb;--bd:#d8d8d4;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161616;--fg:#eee;--card:#222;--bd:#3a3a3a}}
+:root[data-theme="dark"]{--bg:#161616;--fg:#eee;--card:#222;--bd:#3a3a3a}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px system-ui,sans-serif}
+main{max-width:520px;margin:auto;padding:16px}
+h1{font-size:22px;margin:4px 0 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:12px}
+button,select,input[type=file]{font:inherit;width:100%;padding:12px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--fg);margin-top:8px}
+button.p{background:var(--ac);color:#fff;border:0}
+button:disabled{opacity:.5}
+label{display:block;margin-top:10px;font-size:14px;opacity:.8}
+canvas{max-width:100%;border:1px solid var(--bd);background:#fff;margin-top:8px}
+#log{font:13px monospace;white-space:pre-wrap;opacity:.85}
+</style>
+</head>
+<body>
+<main>
+<h1>🖨️ USB Print</h1>
+
+<div class="card">
+<b>1. Printer</b>
+<button id="conn">Connect USB printer</button>
+<div id="pname" style="margin-top:8px;font-size:14px">Not connected</div>
+</div>
+
+<div class="card">
+<b>2. File</b>
+<input type="file" id="file" accept="image/*,application/pdf">
+<label>Printer language</label>
+<select id="lang"><option value="pcl">PCL 5 (HP LaserJet, many Brother/Canon/Samsung)</option><option value="ps">PostScript</option></select>
+<label>Content type</label>
+<select id="mode"><option value="text">Document / text (sharp black &amp; white)</option><option value="photo">Photo (dithered)</option></select>
+<label>Paper</label>
+<select id="paper"><option value="a4">A4</option><option value="letter">Letter</option></select>
+<canvas id="prev"></canvas>
+</div>
+
+<div class="card">
+<button class="p" id="print" disabled>Print</button>
+<div id="log"></div>
+</div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const log=t=>$('log').textContent=t;
+const DPI=300, MARGIN=60;
+let dev=null, outEp=null, ifaceNum=null, pages=[]; // pages: canvases (gray source)
+
+if(window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+function paperPx(){return $('paper').value==='a4'?[2480,3508]:[2550,3300];}
+
+$('conn').onclick=async()=>{
+  if(!navigator.usb){log('WebUSB not available. Use Chrome on Android (or desktop) over https, and open this page directly, not inside another app.');return;}
+  try{
+    dev=await navigator.usb.requestDevice({filters:[{classCode:7},{}]});
+    await dev.open();
+    if(!dev.configuration) await dev.selectConfiguration(1);
+    let found=false;
+    for(const i of dev.configuration.interfaces){
+      for(const a of i.alternates){
+        if(a.interfaceClass===7){
+          const ep=a.endpoints.find(e=>e.direction==='out');
+          if(ep){ifaceNum=i.interfaceNumber;outEp=ep.endpointNumber;
+            await dev.claimInterface(ifaceNum);
+            if(a.alternateSetting) await dev.selectAlternateInterface(ifaceNum,a.alternateSetting);
+            found=true;break;}
+        }
+      }
+      if(found)break;
+    }
+    if(!found){log('Connected, but no printer-class USB interface found.');return;}
+    $('pname').textContent='Connected: '+(dev.manufacturerName||'')+' '+(dev.productName||'USB printer');
+    log('Printer ready.');
+    updateBtn();
+  }catch(e){log('Connect failed: '+e.message);}
+};
+
+function updateBtn(){$('print').disabled=!(dev&&outEp!==null&&pages.length);}
+
+async function loadFile(f){
+  pages=[];
+  log('Loading...');
+  if(f.type==='application/pdf'){
+    const pdf=await pdfjsLib.getDocument({data:new Uint8Array(await f.arrayBuffer())}).promise;
+    for(let n=1;n<=pdf.numPages;n++){
+      const p=await pdf.getPage(n);
+      const v0=p.getViewport({scale:1});
+      const [W,H]=paperPx();
+      const s=Math.min((W-2*MARGIN)/v0.width,(H-2*MARGIN)/v0.height);
+      const v=p.getViewport({scale:s});
+      const c=document.createElement('canvas');c.width=Math.round(v.width);c.height=Math.round(v.height);
+      const ctx=c.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,c.width,c.height);
+      await p.render({canvasContext:ctx,viewport:v}).promise;
+      pages.push(c);
+    }
+  }else{
+    const bmp=await createImageBitmap(f);
+    const c=document.createElement('canvas');c.width=bmp.width;c.height=bmp.height;
+    c.getContext('2d').drawImage(bmp,0,0);pages.push(c);
+  }
+  preview();
+  log(pages.length+' page(s) ready.');
+  updateBtn();
+}
+$('file').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0]).catch(err=>log('Load failed: '+err.message));};
+['paper','mode'].forEach(id=>$(id).onchange=()=>{if(pages.length&&$('file').files[0]&&id==='paper')loadFile($('file').files[0]);else preview();});
+
+// Compose source onto a full page, fit & centered
+function compose(src){
+  const [W,H]=paperPx();
+  const c=document.createElement('canvas');c.width=W;c.height=H;
+  const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,W,H);
+  const s=Math.min((W-2*MARGIN)/src.width,(H-2*MARGIN)/src.height);
+  const w=src.width*s,h=src.height*s;
+  x.imageSmoothingQuality='high';
+  x.drawImage(src,(W-w)/2,MARGIN,w,h);
+  return c;
+}
+
+// Returns {w,h,rowBytes,data} with bit 1 = black
+function toBits(c){
+  const W=c.width,H=c.height;
+  const px=c.getContext('2d').getImageData(0,0,W,H).data;
+  const g=new Float32Array(W*H);
+  for(let i=0;i<W*H;i++)g[i]=0.299*px[i*4]+0.587*px[i*4+1]+0.114*px[i*4+2];
+  const photo=$('mode').value==='photo';
+  const rb=(W+7)>>3, out=new Uint8Array(rb*H);
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const i=y*W+x, old=g[i];
+      let nv;
+      if(photo){
+        nv=old<128?0:255;const e=old-nv;
+        if(x+1<W)g[i+1]+=e*7/16;
+        if(y+1<H){ if(x>0)g[i+W-1]+=e*3/16; g[i+W]+=e*5/16; if(x+1<W)g[i+W+1]+=e*1/16; }
+      }else nv=old<170?0:255;
+      if(nv===0)out[y*rb+(x>>3)]|=0x80>>(x&7);
+    }
+  }
+  return {w:W,h:H,rb,data:out};
+}
+
+function preview(){
+  if(!pages.length)return;
+  const c=compose(pages[0]);const p=$('prev');
+  p.width=c.width/4;p.height=c.height/4;
+  p.getContext('2d').drawImage(c,0,0,p.width,p.height);
+}
+
+const enc=s=>new TextEncoder().encode(s);
+const cat=arr=>{const n=arr.reduce((a,b)=>a+b.length,0),o=new Uint8Array(n);let p=0;for(const a of arr){o.set(a,p);p+=a.length;}return o;};
+
+function buildPCL(pgs){
+  const parts=[enc('\x1bE\x1b%-12345X@PJL\r\n@PJL ENTER LANGUAGE=PCL\r\n\x1bE')];
+  const size=$('paper').value==='a4'?26:2;
+  for(const b of pgs){
+    parts.push(enc(`\x1b&l${size}A\x1b&l0E\x1b*t${DPI}R\x1b*p0x0Y\x1b*r${b.w}S\x1b*r0F\x1b*r1A`));
+    for(let y=0;y<b.h;y++){
+      parts.push(enc(`\x1b*b${b.rb}W`),b.data.subarray(y*b.rb,(y+1)*b.rb));
+    }
+    parts.push(enc('\x1b*rC\f'));
+  }
+  parts.push(enc('\x1bE\x1b%-12345X'));
+  return cat(parts);
+}
+
+function buildPS(pgs){
+  const parts=[enc('%!PS-Adobe-3.0\n')];
+  const [pw,ph]=$('paper').value==='a4'?[595.276,841.89]:[612,792];
+  const hex='0123456789abcdef';
+  for(const b of pgs){
+    parts.push(enc(`<< /PageSize [${pw} ${ph}] >> setpagedevice\n/DeviceGray setcolorspace\n${pw} ${ph} scale\n<< /ImageType 1 /Width ${b.w} /Height ${b.h} /BitsPerComponent 1 /Decode [0 1] /ImageMatrix [${b.w} 0 0 -${b.h} 0 ${b.h}] /DataSource currentfile /ASCIIHexDecode filter >> image\n`));
+    // PS gray: 0 = black, so invert (our bit 1 = black)
+    const total=b.data.length, h=new Uint8Array(total*2+1);
+    for(let i=0;i<total;i++){const v=~b.data[i]&255;h[2*i]=hex.charCodeAt(v>>4);h[2*i+1]=hex.charCodeAt(v&15);}
+    h[total*2]=62; // '>'
+    parts.push(h,enc('\nshowpage\n'));
+  }
+  return cat(parts);
+}
+
+async function send(buf){
+  const CH=16384;
+  for(let i=0;i<buf.length;i+=CH){
+    await dev.transferOut(outEp,buf.subarray(i,i+CH));
+    if(i%(CH*16)===0)log(`Sending ${Math.round(i/buf.length*100)}%`);
+  }
+}
+
+$('print').onclick=async()=>{
+  $('print').disabled=true;
+  try{
+    log('Preparing pages...');
+    await new Promise(r=>setTimeout(r,30));
+    const bits=[];
+    for(const p of pages){bits.push(toBits(compose(p)));await new Promise(r=>setTimeout(r,0));}
+    const data=$('lang').value==='pcl'?buildPCL(bits):buildPS(bits);
+    log('Sending to printer...');
+    await send(data);
+    log('Sent! If nothing prints, try the other printer language.');
+  }catch(e){log('Print failed: '+e.message);}
+  updateBtn();
+};
+</script>
+</body>
+</html>
